@@ -1,0 +1,40 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ===== Virtualenv =====
+.venv/
+venv/
+ENV/
+env/
+
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+
+# ===== Logs =====
+*.log
+
+# ===== Build / PyInstaller =====
+build/
+dist/
+*.spec
+
+# PyInstaller runtime artifacts (sometimes created by onefile runs)
+*.manifest
+*.toc
+
+# ===== Testing / Coverage (optional) =====
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===== Local config / secrets (if you add later) =====
+config.json
+*.env
+.env
