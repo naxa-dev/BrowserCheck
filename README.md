@@ -4,6 +4,8 @@ Windows PC에 설치된 주요 브라우저(Chrome / Edge / Firefox / Opera)의
 **설치된 버전과 최신 버전을 비교**하여  
 업데이트 필요 여부를 한눈에 확인할 수 있는 Tkinter 기반 GUI 프로그램입니다.
 
+<img width="721" height="304" alt="image" src="https://github.com/user-attachments/assets/c252b193-d890-4f54-97cf-747846b7f6ef" />
+
 ---
 
 ## 주요 특징
