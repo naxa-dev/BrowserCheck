@@ -20,6 +20,7 @@ import time
 import webbrowser
 import tkinter as tk
 from tkinter import ttk
+import urllib.error
 import urllib.request
 
 
@@ -104,7 +105,7 @@ def fetch_text(url: str, timeout: int = 15):
 
 
 def compare_versions(v1: str, v2: str) -> int:
-    # 1.2.3.4 형태를 숫자 리스트로 만들어서 비교
+    """전체 버전 비교 (내부 정렬용)"""
     def parse(v: str):
         out = []
         for x in v.split("."):
@@ -127,12 +128,28 @@ def compare_versions(v1: str, v2: str) -> int:
     return 0
 
 
+def get_major(v: str) -> int:
+    """버전 문자열에서 메이저(첫 번째 숫자)만 추출. 예: '145.0.7632.118' → 145"""
+    try:
+        return int(v.split(".")[0])
+    except Exception:
+        return -1
+
+
 def determine_status(local, latest) -> str:
+    """메이저 버전(맨 앞 숫자)만 비교해서 최신 여부 판단.
+    예: local=145.x.x, latest=145.x.x → 최신 버전
+        local=144.x.x, latest=145.x.x → 업데이트 필요
+    """
     if local is None:
         return "미설치"
     if latest is None:
         return "확인 실패"
-    return "업데이트 필요" if compare_versions(local, latest) < 0 else "최신 버전"
+    lm = get_major(local)
+    rm = get_major(latest)
+    if lm < rm:
+        return "업데이트 필요"
+    return "최신 버전"
 
 
 # =========================================================
@@ -146,11 +163,12 @@ def get_file_version_powershell(exe_path: str):
     - 실패: None
     """
     try:
+        safe_path = exe_path.replace("'", "''")  # PowerShell 작은따옴표 이스케이프
         cmd = [
             "powershell",
             "-NoProfile",
             "-Command",
-            f"(Get-Item '{exe_path}').VersionInfo.FileVersion",
+            f"(Get-Item '{safe_path}').VersionInfo.FileVersion",
         ]
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
         return out or None
@@ -181,27 +199,69 @@ def get_local_version(exe_paths):
 # 5) 최신 버전 조회 (브라우저별)
 # =========================================================
 
+def _chrome_version_from_releases_api(channel: str):
+    """
+    Chrome releases API에서 특정 채널의 최신 버전을 가져옴.
+
+    versions API 대신 releases API를 사용하는 이유:
+    - versions API(versionhistory)는 단계적 롤아웃 중인 버전도 즉시 목록에 추가됨
+    - releases API는 실제 배포 완료(fraction=1.0) 기준으로 버전을 제공하므로 더 정확함
+
+    예: 146이 일부 사용자에게만 배포 중일 때 versions API에는 146이 첫 번째로 표시되지만,
+        releases API에서 fraction=1.0 기준으로 필터하면 145가 최신으로 반환됨.
+    """
+    url = (
+        f"https://versionhistory.googleapis.com/v1/chrome/platforms/win64"
+        f"/channels/{channel}/versions/all/releases"
+        f"?orderBy=startTime%20desc&filter=endtime=none"
+    )
+    data = fetch_json(url)
+    if not data:
+        return None
+
+    releases = data.get("releases") or []
+
+    # fraction이 1.0인 것(완전 배포 완료)만 추려서 가장 높은 버전 반환
+    # 없으면 fraction 무관하게 가장 높은 버전 반환
+    best_full = None
+    best_any = None
+
+    for rel in releases:
+        v = rel.get("version")
+        if not (isinstance(v, str) and v):
+            continue
+        fraction = rel.get("fraction", 0)
+
+        if best_any is None or compare_versions(v, best_any) > 0:
+            best_any = v
+        if fraction >= 1.0:
+            if best_full is None or compare_versions(v, best_full) > 0:
+                best_full = v
+
+    result = best_full if best_full else best_any
+    p(f"Chrome {channel}: best_full={best_full}, best_any={best_any} → {result}")
+    return result
+
+
 def latest_chrome():
-    data = fetch_json("https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions")
-    if not data:
-        return None
-
-    versions = data.get("versions") or []
-    if not versions:
-        return None
-
-    v = versions[0].get("version")
-    return v if isinstance(v, str) and v else None
+    return _chrome_version_from_releases_api("stable")
 
 
-def latest_edge():
+def latest_chrome_beta():
+    return _chrome_version_from_releases_api("beta")
+
+
+def _edge_versions():
+    """Edge API를 한 번만 호출해서 stable, beta 버전을 동시에 반환."""
     data = fetch_json("https://edgeupdates.microsoft.com/api/products")
+    stable = None
+    beta = None
     if not data:
-        return None
+        return stable, beta
 
-    latest = None
     for product in data:
-        if product.get("Product") != "Stable":
+        kind = product.get("Product")
+        if kind not in ("Stable", "Beta"):
             continue
 
         for rel in product.get("Releases", []):
@@ -209,47 +269,111 @@ def latest_edge():
                 continue
             if rel.get("Architecture") not in ("x64", "x86"):
                 continue
-
             v = rel.get("ProductVersion")
             if not (isinstance(v, str) and v):
                 continue
 
-            if latest is None or compare_versions(v, latest) > 0:
-                latest = v
+            if kind == "Stable":
+                if stable is None or compare_versions(v, stable) > 0:
+                    stable = v
+            else:
+                if beta is None or compare_versions(v, beta) > 0:
+                    beta = v
 
-    return latest
+    return stable, beta
+
+
+# 캐시: _work()에서 브라우저별 스레드가 동시에 호출해도 한 번만 요청
+_edge_cache = {}
+_edge_lock  = threading.Lock()
+
+def _get_edge_versions():
+    with _edge_lock:
+        if not _edge_cache:
+            s, b = _edge_versions()
+            _edge_cache["stable"] = s
+            _edge_cache["beta"]   = b
+    return _edge_cache["stable"], _edge_cache["beta"]
+
+
+def latest_edge():
+    return _get_edge_versions()[0]
+
+
+def latest_edge_beta():
+    return _get_edge_versions()[1]
+
+
+def _firefox_versions():
+    """Firefox API를 한 번만 호출해서 stable, beta 버전을 동시에 반환."""
+    data = fetch_json("https://product-details.mozilla.org/1.0/firefox_versions.json")
+    if not data:
+        return None, None
+    stable = data.get("LATEST_FIREFOX_VERSION")
+    beta   = data.get("LATEST_FIREFOX_DEVEL_VERSION") or data.get("FIREFOX_DEVEDITION")
+    stable = stable if isinstance(stable, str) and stable else None
+    beta   = beta   if isinstance(beta,   str) and beta   else None
+    return stable, beta
+
+
+_firefox_cache = {}
+_firefox_lock  = threading.Lock()
+
+def _get_firefox_versions():
+    with _firefox_lock:
+        if not _firefox_cache:
+            s, b = _firefox_versions()
+            _firefox_cache["stable"] = s
+            _firefox_cache["beta"]   = b
+    return _firefox_cache["stable"], _firefox_cache["beta"]
 
 
 def latest_firefox():
-    data = fetch_json("https://product-details.mozilla.org/1.0/firefox_versions.json")
-    if not data:
-        return None
-
-    v = data.get("LATEST_FIREFOX_VERSION")
-    return v if isinstance(v, str) and v else None
+    return _get_firefox_versions()[0]
 
 
-def latest_opera():
-    html = fetch_text("https://get.geo.opera.com/ftp/pub/opera/desktop/")
+def latest_firefox_beta():
+    return _get_firefox_versions()[1]
+
+
+def _opera_latest_from_ftp(ftp_url: str):
+    """
+    오페라 FTP 인덱스 페이지에서 버전 디렉터리 목록을 파싱해 최신 버전 반환.
+    채널별 FTP 경로:
+      Stable   : https://get.geo.opera.com/ftp/pub/opera/desktop/
+      Beta     : https://get.geo.opera.com/ftp/pub/opera-beta/
+      Developer: https://get.geo.opera.com/ftp/pub/opera-developer/
+    """
+    html = fetch_text(ftp_url)
     if not html:
         return None
-
-    # 127.0.0000.00/ 형태 추출 후 최댓값 선택
     candidates = re.findall(r"(\d+\.\d+\.\d+\.\d+)/", html)
-
     latest = None
     for v in candidates:
         if latest is None or compare_versions(v, latest) > 0:
             latest = v
-
+    p(f"Opera FTP [{ftp_url}] → {latest}")
     return latest
 
 
+def latest_opera():
+    return _opera_latest_from_ftp("https://get.geo.opera.com/ftp/pub/opera/desktop/")
+
+
+def latest_opera_beta():
+    # Beta와 Developer 중 더 높은 버전 반환
+    beta = _opera_latest_from_ftp("https://get.geo.opera.com/ftp/pub/opera-beta/")
+    dev  = _opera_latest_from_ftp("https://get.geo.opera.com/ftp/pub/opera-developer/")
+    if beta and dev:
+        return beta if compare_versions(beta, dev) >= 0 else dev
+    return beta or dev
+
+
 LATEST_FETCHERS = {
-    "chrome": latest_chrome,
-    "edge": latest_edge,
-    "firefox": latest_firefox,
-    "opera": latest_opera,
+    "chrome":  (latest_chrome,       latest_chrome_beta),
+    "edge":    (latest_edge,         latest_edge_beta),
+    "firefox": (latest_firefox,      latest_firefox_beta),
+    "opera":   (latest_opera,        latest_opera_beta),
 }
 
 
@@ -257,11 +381,28 @@ LATEST_FETCHERS = {
 # 6) UI
 # =========================================================
 
+COLUMNS = ("name", "local", "latest", "status", "beta")
+COL_HEADERS = {
+    "name":   "브라우저",
+    "local":  "내 PC 버전",
+    "latest": "최신 버전 (Stable)",
+    "status": "상태",
+    "beta":   "베타 버전",
+}
+COL_WIDTHS = {
+    "name":   110,
+    "local":  160,
+    "latest": 160,
+    "status": 110,
+    "beta":   160,
+}
+
+
 class BrowserCheckerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("브라우저 업데이트 확인")
-        self.root.minsize(720, 280)
+        self.root.minsize(800, 280)
 
         self.by_name = {x["name"]: x for x in BROWSER_CONFIG}
 
@@ -275,21 +416,18 @@ class BrowserCheckerApp:
         tk.Button(top, text="새로고침", command=self.refresh).pack(side="right")
 
         # 테이블
-        self.tree = ttk.Treeview(root, columns=("name", "local", "latest", "status"), show="headings", height=8)
+        self.tree = ttk.Treeview(
+            root, columns=COLUMNS, show="headings", height=8
+        )
         self.tree.pack(fill="both", expand=True, padx=10, pady=6)
 
-        self.tree.heading("name", text="브라우저")
-        self.tree.heading("local", text="내 PC 버전")
-        self.tree.heading("latest", text="최신 버전")
-        self.tree.heading("status", text="상태")
+        for col in COLUMNS:
+            self.tree.heading(col, text=COL_HEADERS[col])
+            anchor = "w" if col != "status" else "center"
+            self.tree.column(col, width=COL_WIDTHS[col], anchor=anchor)
 
-        self.tree.column("name", width=120, anchor="w")
-        self.tree.column("local", width=180, anchor="w")
-        self.tree.column("latest", width=180, anchor="w")
-        self.tree.column("status", width=120, anchor="w")
-
-        # 색상(아이콘 없음)
-        self.tree.tag_configure("ok", foreground="#0f7b0f")
+        # 색상 태그
+        self.tree.tag_configure("ok",   foreground="#0f7b0f")
         self.tree.tag_configure("need", foreground="#c1121f")
         self.tree.tag_configure("none", foreground="#6b7280")
         self.tree.tag_configure("fail", foreground="#6b7280")
@@ -306,7 +444,8 @@ class BrowserCheckerApp:
         # 초기 행 생성
         for c in BROWSER_CONFIG:
             name = c["name"]
-            self.tree.insert("", "end", iid=name, values=(name, "", "", ""), tags=("none",))
+            self.tree.insert("", "end", iid=name,
+                             values=(name, "", "", "", ""), tags=("none",))
 
         self.refresh()
 
@@ -317,38 +456,65 @@ class BrowserCheckerApp:
         self.set_status("조회 중…")
         p("새로고침 시작")
 
+        # 새로고침마다 Edge/Firefox 캐시 초기화 (최신 데이터 재조회)
+        _edge_cache.clear()
+        _firefox_cache.clear()
+
         for c in BROWSER_CONFIG:
             name = c["name"]
-            self.tree.item(name, values=(name, "...", "...", "조회 중…"), tags=("none",))
+            self.tree.item(name,
+                           values=(name, "...", "...", "조회 중…", "..."),
+                           tags=("none",))
 
         threading.Thread(target=self._work, daemon=True).start()
 
+    def _fetch_one(self, c: dict, results: dict, done_event: threading.Event, remaining: list) -> None:
+        """브라우저 1개 조회 후 results에 저장, 모두 끝나면 done_event 세팅."""
+        name       = c["name"]
+        latest_key = c["latest_key"]
+
+        local = get_local_version(c["exe_paths"])
+
+        fetchers = LATEST_FETCHERS.get(latest_key, (None, None))
+        fn_stable, fn_beta = fetchers
+
+        latest = fn_stable() if fn_stable else None
+        beta   = fn_beta()   if fn_beta   else None
+
+        status = determine_status(local, latest)
+        tag = {"최신 버전": "ok", "업데이트 필요": "need",
+               "미설치": "none"}.get(status, "fail")
+
+        results[name] = (local, latest, status, tag, beta)
+
+        # UI 즉시 반영 (조회 완료 순서대로)
+        def ui_update(n=name, lv=local, rv=latest, st=status, tg=tag, bv=beta):
+            self.tree.item(n,
+                           values=(n, lv or "", rv or "", st, bv or ""),
+                           tags=(tg,))
+        self.root.after(0, ui_update)
+
+        with threading.Lock():
+            remaining.remove(name)
+            if not remaining:
+                done_event.set()
+
     def _work(self) -> None:
+        results   = {}
+        remaining = [c["name"] for c in BROWSER_CONFIG]
+        done      = threading.Event()
+
+        threads = []
         for c in BROWSER_CONFIG:
-            name = c["name"]
-            latest_key = c["latest_key"]
+            t = threading.Thread(
+                target=self._fetch_one,
+                args=(c, results, done, remaining),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
 
-            local = get_local_version(c["exe_paths"])
-
-            fn = LATEST_FETCHERS.get(latest_key)
-            latest = fn() if fn else None
-
-            status = determine_status(local, latest)
-
-            if status == "최신 버전":
-                tag = "ok"
-            elif status == "업데이트 필요":
-                tag = "need"
-            elif status == "미설치":
-                tag = "none"
-            else:
-                tag = "fail"
-
-            def ui_update(n=name, lv=local, rv=latest, st=status, tg=tag):
-                self.tree.item(n, values=(n, lv or "", rv or "", st), tags=(tg,))
-
-            self.root.after(0, ui_update)
-
+        done.wait()
         self.root.after(0, lambda: self.set_status("완료"))
         p("새로고침 완료")
 
@@ -377,7 +543,13 @@ class BrowserCheckerApp:
             return
 
         vals = self.tree.item(name, "values")
-        text = f"브라우저: {vals[0]}\n내 PC 버전: {vals[1]}\n최신 버전: {vals[2]}\n상태: {vals[3]}"
+        text = (
+            f"브라우저: {vals[0]}\n"
+            f"내 PC 버전: {vals[1]}\n"
+            f"최신 버전 (Stable): {vals[2]}\n"
+            f"상태: {vals[3]}\n"
+            f"베타 버전: {vals[4]}"
+        )
 
         try:
             self.root.clipboard_clear()
